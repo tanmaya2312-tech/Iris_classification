@@ -1,11 +1,20 @@
 """
-Iris Flower Predictor - Streamlit app (KNN) with tabbed UI
+Iris Flower Predictor - Streamlit app (KNN only)
+
+Features:
+  - Live prediction with confidence and a "near the boundary" warning
+  - Distance metric selector (Euclidean / Manhattan / Minkowski) and
+    uniform vs distance-weighted voting
+  - Decision boundary plot that changes with k, metric and weighting
+  - Batch prediction from an uploaded CSV
+  - Data exploration and model performance tabs
 
 Run:  python -m streamlit run iris_app.py
 Requires: streamlit, scikit-learn, pandas, matplotlib, seaborn
 """
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import seaborn as sns
 import streamlit as st
@@ -49,6 +58,14 @@ SPECIES_STYLE = {
     "virginica":  {"emoji": "🌺", "color": "linear-gradient(120deg,#11998e,#38ef7d)"},
 }
 
+# Distance metric options: label -> (metric, p)
+METRICS = {
+    "Euclidean": ("minkowski", 2),
+    "Manhattan": ("manhattan", 1),
+    "Minkowski (p=3)": ("minkowski", 3),
+}
+WEIGHTS = {"Uniform (equal vote)": "uniform", "Distance-weighted": "distance"}
+
 # ---------------------------------------------------------------------- Data
 iris = load_iris(as_frame=True)
 X, y = iris.data, iris.target
@@ -63,11 +80,21 @@ PRESETS = {
     "💜 Versicolor": [5.9, 2.8, 4.3, 1.3],
     "🌺 Virginica":  [6.6, 3.0, 5.6, 2.0],
 }
+SHORT_NAMES = ["sepal_length", "sepal_width", "petal_length", "petal_width"]
 
 
 def set_preset(values):
     for key, val in zip(KEYS, values):
         st.session_state[key] = val
+
+
+def make_model(k, metric_label, weights_label):
+    metric, p = METRICS[metric_label]
+    return make_pipeline(
+        StandardScaler(),
+        KNeighborsClassifier(n_neighbors=k, metric=metric, p=p,
+                             weights=WEIGHTS[weights_label]),
+    )
 
 
 @st.cache_data
@@ -76,39 +103,61 @@ def split_data():
 
 
 @st.cache_data
-def k_search(max_k=25):
+def k_search(metric_label, weights_label, max_k=25):
     X_tr, _, y_tr, _ = split_data()
-    scores = []
-    for k in range(1, max_k + 1):
-        m = make_pipeline(StandardScaler(), KNeighborsClassifier(n_neighbors=k))
-        scores.append(cross_val_score(m, X_tr, y_tr, cv=5).mean())
-    return scores
+    return [
+        cross_val_score(make_model(k, metric_label, weights_label),
+                        X_tr, y_tr, cv=5).mean()
+        for k in range(1, max_k + 1)
+    ]
 
 
 @st.cache_data
-def evaluate(k: int):
+def evaluate(k, metric_label, weights_label):
     X_tr, X_te, y_tr, y_te = split_data()
-    m = make_pipeline(StandardScaler(), KNeighborsClassifier(n_neighbors=k))
+    m = make_model(k, metric_label, weights_label)
     cv = cross_val_score(m, X_tr, y_tr, cv=5).mean()
     m.fit(X_tr, y_tr)
     pred = m.predict(X_te)
-    return cv, m.score(X_te, y_te), confusion_matrix(y_te, pred), \
-        classification_report(y_te, pred, target_names=class_names, output_dict=True)
+    return (cv, m.score(X_te, y_te), confusion_matrix(y_te, pred),
+            classification_report(y_te, pred, target_names=class_names,
+                                  output_dict=True))
+
+
+@st.cache_data
+def compare_settings(k):
+    """CV and test accuracy for every metric / weighting combination at this k."""
+    rows = []
+    for metric_label in METRICS:
+        for weights_label in WEIGHTS:
+            cv, test, _, _ = evaluate(k, metric_label, weights_label)
+            rows.append({"Distance metric": metric_label,
+                         "Voting": weights_label.split(" (")[0],
+                         "CV accuracy": round(cv, 4),
+                         "Test accuracy": round(test, 4)})
+    return pd.DataFrame(rows)
 
 
 @st.cache_data
 def make_pairplot():
-    g = sns.pairplot(df, hue="species", corner=True, height=2.0)
-    return g.figure
+    return sns.pairplot(df, hue="species", corner=True, height=2.0).figure
+
+
+def normalise_columns(frame):
+    """Accept 'sepal_length', 'sepal length (cm)', 'Sepal Length' etc."""
+    frame = frame.copy()
+    frame.columns = [
+        str(c).strip().lower().replace(" (cm)", "").replace(" ", "_")
+        for c in frame.columns
+    ]
+    return frame
 
 
 # ------------------------------------------------------------------- Sidebar
 st.sidebar.title("🌸 Controls")
 st.sidebar.subheader("Quick examples")
-cols = st.sidebar.columns(3)
-for col, (label, vals) in zip(cols, PRESETS.items()):
-    col.button(label.split()[0], help=label, on_click=set_preset, args=(vals,),
-               use_container_width=False)
+for col, (label, vals) in zip(st.sidebar.columns(3), PRESETS.items()):
+    col.button(label.split()[0], help=label, on_click=set_preset, args=(vals,))
 
 st.sidebar.subheader("Flower measurements (cm)")
 for key, name in zip(KEYS, feature_names):
@@ -118,13 +167,17 @@ for key, name in zip(KEYS, feature_names):
     st.sidebar.slider(name, round(lo - 0.5, 1), round(hi + 0.5, 1), step=0.1, key=key)
 inputs = {name: st.session_state[key] for key, name in zip(KEYS, feature_names)}
 
-st.sidebar.subheader("Model")
-best_k = k_search().index(max(k_search())) + 1
-k = st.sidebar.slider("k (neighbours)", 1, 25, best_k,
-                      help=f"Cross-validation suggests k = {best_k}")
+st.sidebar.subheader("KNN settings")
+default_scores = k_search("Euclidean", "Uniform (equal vote)")
+default_k = default_scores.index(max(default_scores)) + 1
+k = st.sidebar.slider("k (neighbours)", 1, 25, default_k,
+                      help=f"Cross-validation suggests k = {default_k} "
+                           "for Euclidean distance with uniform voting")
+metric_label = st.sidebar.selectbox("Distance metric", list(METRICS))
+weights_label = st.sidebar.radio("Voting", list(WEIGHTS))
 
 # --------------------------------------------------------------------- Model
-model = make_pipeline(StandardScaler(), KNeighborsClassifier(n_neighbors=k))
+model = make_model(k, metric_label, weights_label)
 model.fit(X, y)
 sample = pd.DataFrame([inputs])
 pred = int(model.predict(sample)[0])
@@ -141,8 +194,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab_predict, tab_data, tab_perf = st.tabs(
-    ["🔮 Predict", "📊 Explore Data", "📈 Model Performance"]
+tab_predict, tab_batch, tab_data, tab_perf = st.tabs(
+    ["🔮 Predict", "📁 Batch Prediction", "📊 Explore Data", "📈 Model Performance"]
 )
 
 # --------------------------------------------------------------- Tab: Predict
@@ -162,39 +215,117 @@ with tab_predict:
             """,
             unsafe_allow_html=True,
         )
+
+        top2 = np.argsort(proba)[::-1][:2]
+        if proba[top2[0]] < 0.8:
+            a, b = class_names[top2[0]], class_names[top2[1]]
+            st.warning(
+                f"⚠️ This flower is near the **{a.capitalize()} / "
+                f"{b.capitalize()}** boundary, so the prediction is less certain."
+            )
+
         st.markdown("**Class probabilities**")
         for name, p in zip(class_names, proba):
             st.progress(float(p), text=f"{name.capitalize()} — {p:.0%}")
 
-        st.markdown("**Your measurements**")
-        m_cols = st.columns(4)
-        for c, (name, val) in zip(m_cols, inputs.items()):
-            c.metric(name.replace(" (cm)", "").replace(" ", "\n"), f"{val} cm")
+        with st.expander(f"🔎 See the {k} nearest training flowers"):
+            scaler = model.named_steps["standardscaler"]
+            knn = model.named_steps["kneighborsclassifier"]
+            dist, idx = knn.kneighbors(scaler.transform(sample))
+            nb = X.iloc[idx[0]].copy()
+            nb["species"] = [class_names[i] for i in y.iloc[idx[0]]]
+            nb["distance"] = dist[0].round(3)
+            st.dataframe(nb, width="stretch")
 
     with right:
-        x_feat = st.selectbox("X axis", feature_names, index=2)
-        y_feat = st.selectbox("Y axis", feature_names, index=3)
-        fig, ax = plt.subplots(figsize=(6, 4.3))
-        for i, name in enumerate(class_names):
-            mask = y == i
-            ax.scatter(X.loc[mask, x_feat], X.loc[mask, y_feat],
-                       label=name, alpha=0.7)
-        ax.scatter(inputs[x_feat], inputs[y_feat], c="red", marker="*", s=320,
-                   edgecolor="k", label="your flower", zorder=5)
-        ax.set_xlabel(x_feat)
-        ax.set_ylabel(y_feat)
-        ax.legend()
-        ax.grid(alpha=0.3)
-        st.pyplot(fig)
+        st.markdown("**Decision boundary**")
+        c1, c2 = st.columns(2)
+        x_feat = c1.selectbox("X axis", feature_names, index=2)
+        y_feat = c2.selectbox("Y axis", feature_names, index=3)
+        if x_feat == y_feat:
+            st.info("Choose two different features to draw the boundary.")
+        else:
+            m2d = make_model(k, metric_label, weights_label)
+            m2d.fit(X[[x_feat, y_feat]].values, y)
+            x_min, x_max = X[x_feat].min() - 0.5, X[x_feat].max() + 0.5
+            y_min, y_max = X[y_feat].min() - 0.5, X[y_feat].max() + 0.5
+            xx, yy = np.meshgrid(np.linspace(x_min, x_max, 250),
+                                 np.linspace(y_min, y_max, 250))
+            zz = m2d.predict(np.c_[xx.ravel(), yy.ravel()]).reshape(xx.shape)
 
-    with st.expander(f"🔎 See the {k} nearest training flowers"):
-        scaler = model.named_steps["standardscaler"]
-        knn = model.named_steps["kneighborsclassifier"]
-        dist, idx = knn.kneighbors(scaler.transform(sample))
-        nb = X.iloc[idx[0]].copy()
-        nb["species"] = [class_names[i] for i in y.iloc[idx[0]]]
-        nb["distance"] = dist[0].round(3)
-        st.dataframe(nb, width="stretch")
+            fig, ax = plt.subplots(figsize=(6, 4.5))
+            ax.contourf(xx, yy, zz, alpha=0.2, cmap="viridis",
+                        levels=[-0.5, 0.5, 1.5, 2.5])
+            for i, name in enumerate(class_names):
+                mask = y == i
+                ax.scatter(X.loc[mask, x_feat], X.loc[mask, y_feat],
+                           label=name, alpha=0.8, edgecolor="k", linewidth=0.3)
+            ax.scatter(inputs[x_feat], inputs[y_feat], c="red", marker="*",
+                       s=340, edgecolor="k", label="your flower", zorder=5)
+            ax.set_xlabel(x_feat)
+            ax.set_ylabel(y_feat)
+            ax.set_title(f"k = {k} · {metric_label} · "
+                         f"{weights_label.split(' (')[0].lower()} voting")
+            ax.legend(fontsize=8)
+            st.pyplot(fig)
+            st.caption("Shaded regions show which species KNN would predict "
+                       "at each point using only these two features. "
+                       "Change k, the metric or the voting in the sidebar to "
+                       "see the regions change.")
+
+# ---------------------------------------------------------- Tab: Batch upload
+with tab_batch:
+    st.subheader("Predict many flowers from a CSV")
+    st.write("Upload a CSV with these columns: "
+             "`sepal_length`, `sepal_width`, `petal_length`, `petal_width`. "
+             "An optional `species` column lets the app check its accuracy.")
+
+    template = df.sample(5, random_state=1).drop(columns="species")
+    template.columns = SHORT_NAMES
+    st.download_button("⬇️ Download a sample CSV", template.to_csv(index=False),
+                       file_name="sample_flowers.csv", mime="text/csv")
+
+    upload = st.file_uploader("Upload your CSV", type="csv")
+    if upload is not None:
+        try:
+            raw = pd.read_csv(upload)
+            data = normalise_columns(raw)
+            missing = [c for c in SHORT_NAMES if c not in data.columns]
+            if missing:
+                st.error(f"Missing column(s): {', '.join(missing)}")
+            else:
+                feats = data[SHORT_NAMES].apply(pd.to_numeric, errors="coerce")
+                bad_rows = feats.isnull().any(axis=1)
+                if bad_rows.any():
+                    st.warning(f"Skipped {int(bad_rows.sum())} row(s) with "
+                               "missing or non-numeric values.")
+                feats = feats[~bad_rows]
+                feats.columns = feature_names  # match the trained model
+                preds = model.predict(feats)
+                probs = model.predict_proba(feats)
+
+                out = raw.loc[feats.index].copy()
+                out["predicted_species"] = [class_names[p] for p in preds]
+                out["confidence"] = probs.max(axis=1).round(3)
+                st.success(f"Predicted {len(out)} flowers "
+                           f"(k={k}, {metric_label}, "
+                           f"{weights_label.split(' (')[0].lower()} voting).")
+                st.dataframe(out, width="stretch")
+                st.bar_chart(out["predicted_species"].value_counts())
+                st.download_button("⬇️ Download predictions",
+                                   out.to_csv(index=False),
+                                   file_name="iris_predictions.csv",
+                                   mime="text/csv")
+
+                if "species" in data.columns:
+                    truth = data.loc[feats.index, "species"].astype(str).str.lower()
+                    acc = (truth.values == out["predicted_species"].values).mean()
+                    st.metric("Accuracy against your 'species' column", f"{acc:.1%}")
+                    st.caption("The model was trained on the full Iris dataset, "
+                               "so this is optimistic if your file contains "
+                               "the same flowers.")
+        except Exception as exc:  # unreadable file, wrong format, etc.
+            st.error(f"Could not read that file: {exc}")
 
 # ------------------------------------------------------------ Tab: Explore
 with tab_data:
@@ -216,22 +347,48 @@ with tab_data:
 
 # ---------------------------------------------------------------- Tab: Perf
 with tab_perf:
-    cv_acc, test_acc, cm, report = evaluate(k)
-    c1, c2, c3 = st.columns(3)
+    cv_acc, test_acc, cm, report = evaluate(k, metric_label, weights_label)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Current k", k)
-    c2.metric("5-fold CV accuracy", f"{cv_acc:.1%}")
-    c3.metric("Test accuracy (20% held out)", f"{test_acc:.1%}")
+    c2.metric("CV accuracy", f"{cv_acc:.1%}")
+    c3.metric("CV error", f"{1 - cv_acc:.1%}")
+    c4.metric("Test accuracy", f"{test_acc:.1%}")
+    c5.metric("Test error", f"{1 - test_acc:.1%}")
+
+    st.subheader("Accuracy and error")
+    labels = ["Cross-validation", "Test set"]
+    acc = [cv_acc * 100, test_acc * 100]
+    err = [100 - a for a in acc]
+    xpos = np.arange(len(labels))
+    fig, ax = plt.subplots(figsize=(6.5, 3.8))
+    bars_acc = ax.bar(xpos - 0.2, acc, 0.4, label="Accuracy (%)", color="#2e9e6b")
+    bars_err = ax.bar(xpos + 0.2, err, 0.4, label="Error (%)", color="#d9534f")
+    ax.bar_label(bars_acc, fmt="%.1f%%", padding=2)
+    ax.bar_label(bars_err, fmt="%.1f%%", padding=2)
+    ax.set_xticks(xpos)
+    ax.set_xticklabels(labels)
+    ax.set_ylim(0, 115)
+    ax.set_ylabel("Percentage")
+    ax.set_title(f"k = {k} · {metric_label} · "
+                 f"{weights_label.split(' (')[0].lower()} voting")
+    ax.legend(loc="upper right")
+    ax.grid(axis="y", alpha=0.3)
+    st.pyplot(fig)
+    st.caption("Error = 100% − accuracy. Test error of 6.7% means 2 of the "
+               "30 test flowers were misclassified.")
 
     left, right = st.columns(2, gap="large")
     with left:
         st.subheader("Choosing k")
-        scores = k_search()
+        scores = k_search(metric_label, weights_label)
+        best_k = scores.index(max(scores)) + 1
         fig, ax = plt.subplots(figsize=(5.5, 4))
         ax.plot(range(1, 26), scores, marker="o")
         ax.axvline(best_k, color="red", linestyle="--", label=f"best k = {best_k}")
         ax.axvline(k, color="green", linestyle=":", label=f"selected k = {k}")
         ax.set_xlabel("k")
         ax.set_ylabel("CV accuracy")
+        ax.set_title(f"{metric_label}, {weights_label.split(' (')[0].lower()} voting")
         ax.legend()
         ax.grid(alpha=0.3)
         st.pyplot(fig)
@@ -243,13 +400,18 @@ with tab_perf:
         st.pyplot(fig)
 
     st.subheader("Classification report")
-    rep = pd.DataFrame(report).T.round(3)
-    st.dataframe(rep, width="stretch")
+    st.dataframe(pd.DataFrame(report).T.round(3), width="stretch")
+
+    st.subheader(f"Effect of distance metric and voting (k = {k})")
+    st.dataframe(compare_settings(k), width="stretch", hide_index=True)
+    st.caption("All rows use KNN. Only the distance metric and the way "
+               "neighbours vote are changed.")
 
 with st.expander("ℹ️ How does KNN work?"):
     st.write(
         "KNN classifies a flower by finding the k closest flowers in the "
-        "training data (after scaling the features) and taking a majority vote "
-        "among their species. The probabilities are the share of the k "
-        "neighbours belonging to each species."
+        "training data (after scaling the features) and taking a vote among "
+        "their species. With uniform voting every neighbour counts equally; "
+        "with distance-weighted voting closer neighbours count more. The "
+        "probabilities are the (weighted) share of neighbours in each species."
     )
